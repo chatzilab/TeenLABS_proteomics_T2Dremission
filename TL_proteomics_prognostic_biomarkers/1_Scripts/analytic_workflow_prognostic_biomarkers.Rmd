@@ -1,0 +1,541 @@
+---
+title: "analytic_workflow_v4"
+author: "Shudi Pan"
+date: today
+toc: true
+toc_expand: 2
+format: 
+  html:
+    code-fold: true
+    html-math-method: katex
+    fontsize: 16pt
+    grid:
+      sidebar-width: 0px
+      body-width: 1500px
+      margin-width: 500px
+      gutter-width: 1.5rem
+embed-resources: true
+editor: visual
+editor_options: 
+  chunk_output_type: console
+execute: 
+  warning: false
+---
+
+```{r setup-select, message=FALSE, warning=FALSE}
+source(here::here("1_Scripts","!libraries.R"))
+source(here::here("1_Scripts","!directories.R"))
+source(here::here("1_Scripts","!load_data.R"))
+
+# BMA code
+source(here::here("1_Scripts", "!feature_selection_v3.R"))
+set.seed(1234)
+```
+
+## preprocessing: UK biobank and only retain hits that were in ukb
+
+```{r}
+source(here::here("1_Scripts","uk_biobank_preprocessing.R"))
+
+
+# filter out proteins with high missing values 
+missing_threshold <- 0.2
+assay_missing <- tl_proteomics_property_sub  %>% 
+  dplyr::filter(MissingFreq > missing_threshold) %>% 
+  dplyr::select(Assay) %>% unlist %>% as.character() %>% 
+  tolower %>% gsub("-", "_", .)
+```
+
+## preprocessing: ft data assemble + outcome definition
+
+```{r}
+data_long <- data_long %>% 
+  dplyr::mutate(
+    t2d = case_when(
+      diab_med == 1 ~ "Diabetes",
+      fpg >= 126 | hba1c >= 6.5 ~ "Diabetes",
+      fpg >= 100 | hba1c >= 5.7 ~ "Prediabetes",
+      fpg < 100 & hba1c < 5.7 ~ "No",
+      .default = NA_character_
+    )
+  )
+
+dat_combined <- data_long %>%
+  dplyr::filter(visit %in% c(1,60)) %>% 
+  dplyr::select(key, visit, t2d, diab_med) %>% 
+  pivot_wider(
+    names_from = visit, 
+    values_from = c(t2d, diab_med), 
+    names_prefix = "visit_") %>%
+  dplyr::mutate(
+    diabetes_remission = case_when(
+      t2d_visit_1 == "Diabetes" & t2d_visit_60 == "Prediabetes" ~ "Yes",
+      t2d_visit_1 == "Diabetes" & t2d_visit_60 == "No" ~ "Yes",
+      t2d_visit_1 == "Diabetes" & t2d_visit_60 == "Diabetes" ~ "No",
+      t2d_visit_1 == "Prediabetes" & t2d_visit_60 == "No" ~ "Yes",
+      t2d_visit_1 == "Prediabetes" & t2d_visit_60 == "Prediabetes" ~ "No",
+      .default = NA_character_
+    )
+  ) %>%
+  dplyr::select(key, diabetes_remission) %>%
+  drop_na(diabetes_remission)  %>% 
+  inner_join(
+    .,
+    tl_proteomics_NPX%>%
+      dplyr::filter(visit == 0) %>% 
+      dplyr::select(-all_of(assay_missing)),
+    by = c("key")) %>% 
+  dplyr::mutate(
+    across(everything(),
+           ~ ifelse(is.na(.), mean(., na.rm = T), .))
+  ) %>% 
+  dplyr::mutate(
+    diabetes_remission = as.factor(diabetes_remission)
+  ) %>%
+  dplyr::select(-visit)
+
+dat_covars <- data_wide %>% dplyr::select(key,parents_education_0,site,race_binary,
+                              sex,agemos_0,bmi_0)
+
+dat_final <- dat_combined %>% left_join(dat_covars, by = c("key"))
+
+#saveRDS(dat_fs, fs::patj("dir_temp", "teen_labs_data"))
+```
+
+## main analysis feature selection BWA to incorporate UK biobank
+
+```{r}
+# sort colnames alphabetically
+dat_fs <- dat_combined %>% select(-key) 
+dat_fs <- dat_fs %>%   
+  select(1, order(colnames(dat_fs)[-1]) + 1)
+# sort p_value and make sure the p-value matched with dat_fs colnames
+fs <- toupper(colnames(dat_fs)[-1])
+p_value_df_ukb <- tl_proteomics_property_sub  %>%
+  filter(Assay %in% fs) %>%
+  arrange(Assay)
+
+
+colnames(dat_fs)[1] <- c("outcome") # change to outcome
+
+# transform p-values to a vector 
+p_value_ukb <- p_value_df_ukb %>% select(p_value) %>% unlist()
+#p_value_ukb_adjusted <- p.adjust(p_value_ukb, "fdr") # the results are the same with or without adjustment
+names(p_value_ukb) <- colnames(dat_fs[-1])
+
+
+# make sure outcome's reference is people who had remission of diabetes
+dat_fs$outcome <- relevel(dat_fs$outcome, ref = "Yes")
+
+system.time(model_output <- modified_bma(dat_fs,p_value_ukb))
+
+#saveRDS(model_output, fs::path(dir_temp, "model_output_BMA_012025.RDS"))
+#model_results <- as.data.frame(model_output[-1])
+
+ppi <- model_output$ppi
+bf <- model_output$bf
+individual_protein <- data.frame(protein = names(ppi), ppi = ppi, bf = bf)
+                                
+#fwrite(individual_protein, fs::path(dir_figures,"bma_ppi_012025.csv"))
+poster_probs <- data.table(combo = model_output$indices, prob = model_output$posterior_probs)
+
+poster_probs <- poster_probs %>% filter(grepl("\\+",combo))
+#fwrite(poster_probs, fs::path(dir_figures,"bma_posterior_prob_combo_012025.csv"))
+
+#poster_probs <- read_csv(fs::path(dir_figures,"bma_posterior_prob_combo_120224.csv"))
+# top ten combinations 
+top_bf <- individual_protein %>% filter(bf > 10) %>%
+  arrange(desc(bf))
+
+ft <- top_bf %>%
+  flextable() %>%
+  colformat_double(digits = 3) %>%
+  autofit()
+ft
+
+```
+
+## prediction performance in TL
+
+```{r}
+set.seed(123)
+# generate the different combinations of proteins
+selected_proteins <- top_bf$protein
+combo_size_1 <- as.list(selected_proteins)
+combo_size_2 <- combn(selected_proteins, 2, simplify = FALSE)
+
+protein_combo <- c(combo_size_1, combo_size_2)
+fs_bs_tsk = as_task_classif(x = dat_final,
+                            target = "diabetes_remission",positive = "No", id = "feature selection")
+fs_bs_tsk$select(selected_proteins)
+fs_bs_tsk$feature_names
+
+fs_bs_tsk$col_roles$stratum <- fs_bs_tsk$target_names # make sure each statum has the same ratio
+
+logic_over <- as_learner( lrn("classif.log_reg", predict_type = "prob"))
+
+results <- list()
+
+for(combo in protein_combo) {
+  subset_tsk <- fs_bs_tsk$clone()$select(combo)
+  subset_tsk$col_roles$stratum <- subset_tsk$target_names
+  rr <- resample(task = subset_tsk, learner = logic_over, resampling = rsmp("cv", folds = 5), store_models = TRUE)  
+   prauc <- rr$aggregate(msr("classif.prauc"))
+   auc <- rr$aggregate(msr("classif.auc"))
+  results[[paste(combo, collapse = " + ")]] <- list(prauc = prauc, auc = auc)
+}
+
+# combine the results
+results_df <- do.call(rbind, lapply(names(results), function(combo) {
+  data.frame(Features = combo, PRAUC = results[[combo]]$prauc, AUC = results[[combo]]$auc)
+}))
+
+# Sort the data frame by the AUC column in descending order
+df_sorted <- results_df %>%
+  arrange(desc(PRAUC))
+
+# Create a flextable, round numeric columns to 3 decimal places, and autofit
+ft <- df_sorted %>%
+  flextable() %>%
+  colformat_double(digits = 3) %>%
+  autofit()
+ft
+#write_csv(results_df, fs::path(dir_figures,"bma_prediction_performance_ukb_012025.csv"))
+```
+
+# solar
+
+## preprocessing: ft data assemble + outcome definition
+
+```{r}
+solar_df <- solar %>%
+  dplyr::select(id, visit, og_glu_5, og_glu120, age, sex, bmi_og, bmiz,edu_house,tot_chol, tag, a1c) %>%
+  mutate(
+    prediabete = case_when(
+    a1c <= 6.4 & a1c >= 5.7 ~ "Yes", 
+    og_glu_5 >= 100 & og_glu_5 <= 125 ~ "Yes",
+    og_glu120 >= 140 & og_glu120 <= 199 ~ "Yes", 
+    is.na(a1c) & is.na(og_glu_5) & is.na(og_glu120) ~ NA_character_,
+    TRUE ~ "No"
+    ), 
+         diabete = case_when(
+           a1c > 6.4 ~ "Yes",
+           og_glu_5 > 125 ~ "Yes",
+           og_glu120 > 199 ~ "Yes",
+           is.na(a1c) & is.na(og_glu_5) & is.na(og_glu120) ~
+             NA_character_,
+           TRUE ~ "No"
+         ),
+    prediabete_or_diabete = case_when(
+      prediabete == "Yes"|diabete == "Yes" ~ "Yes",
+      prediabete == "No" & diabete == "No" ~ "No"
+    )
+  ) %>%
+  mutate(prediabete_or_diabete = as.factor(prediabete_or_diabete))
+
+# pivot wider
+solar_df_w <- solar_df %>% 
+  pivot_wider(
+    names_from = "visit",
+    values_from = og_glu_5:prediabete_or_diabete
+  )
+
+solar_df_w1 <- solar_df_w %>%
+  mutate(
+         diabete_change = case_when(
+           prediabete_or_diabete_1 == "No"&
+             prediabete_or_diabete_2 == "No" ~ "No to no",
+           prediabete_1 == "Yes" & 
+             prediabete_2 == "Yes" ~ "Prediabete to prediabete",
+           diabete_1 == "Yes" &
+             diabete_2 == "Yes" ~ "Diabete to diabete",
+           prediabete_or_diabete_1 == "No" &
+             prediabete_2 == "Yes" ~ "No to prediabete",
+           prediabete_or_diabete_1 == "No" &
+             diabete_2 == "Yes" ~ "No to diabete",
+           prediabete_1 == "Yes" &
+             diabete_2 == "Yes" ~ "Prediabete to diabete",
+           prediabete_1 =="Yes" &
+             prediabete_or_diabete_2 == "No" ~ "Prediabete to no",
+           diabete_1 == "Yes" & 
+             prediabete_2 == "Yes" ~ "Diabete to prediabete",
+           diabete_1 == "Yes" &
+             prediabete_or_diabete_2 == "No" ~ "Diabete to no")) %>%
+   mutate(a1c_baseline = a1c_1,
+          a1c_fu = a1c_2,
+          og_glu_5_baseline = og_glu_5_1,
+          og_glu_5_fu = og_glu_5_2,
+          og_glu120_baseline = og_glu120_1,
+          og_glu120_fu = og_glu120_2)
+
+## Adding missing participants to the data. 
+missing_solar_df_w<- solar_df_w %>%
+  filter(id == "r02_sol_00078"|id == "r02_sol_00178") %>%
+  mutate(
+         diabete_change = case_when(
+           prediabete_or_diabete_2 == "No"&
+             prediabete_or_diabete_3 == "No" ~ "No to no",
+           prediabete_2 == "Yes" & 
+             prediabete_3 == "Yes" ~ "Prediabete to prediabete",
+           diabete_2 == "Yes" &
+             diabete_3 == "Yes" ~ "Diabete to diabete",
+           prediabete_or_diabete_2 == "No" &
+             prediabete_3 == "Yes" ~ "No to prediabete",
+           prediabete_or_diabete_2 == "No" &
+             diabete_3 == "Yes" ~ "No to diabete",
+           prediabete_2 == "Yes" &
+             diabete_3 == "Yes" ~ "Prediabete to diabete",
+           prediabete_2 =="Yes" &
+             prediabete_or_diabete_3 == "No" ~ "Prediabete to no",
+           diabete_2 == "Yes" & 
+             prediabete_3 == "Yes" ~ "Diabete to prediabete",
+           diabete_2 == "Yes" &
+             prediabete_or_diabete_3 == "No" ~ "Diabete to no")) %>%
+   mutate(a1c_baseline = a1c_2,
+          a1c_fu = a1c_3,
+          og_glu_5_baseline = og_glu_5_2,
+          og_glu_5_fu = og_glu_5_3,
+          og_glu120_baseline = og_glu120_2,
+          og_glu120_fu = og_glu120_3)
+
+missing_solar_df_w2<- solar_df_w %>%
+  filter(!is.na(og_glu_5_1) & is.na(og_glu_5_2) & !is.na(og_glu_5_3)) %>%
+  mutate(
+         diabete_change = case_when(
+           prediabete_or_diabete_1 == "No"&
+             prediabete_or_diabete_3 == "No" ~ "No to no",
+           prediabete_1 == "Yes" & 
+             prediabete_3 == "Yes" ~ "Prediabete to prediabete",
+           diabete_1 == "Yes" &
+             diabete_3 == "Yes" ~ "Diabete to diabete",
+           prediabete_or_diabete_1 == "No" &
+             prediabete_3 == "Yes" ~ "No to prediabete",
+           prediabete_or_diabete_1 == "No" &
+             diabete_3 == "Yes" ~ "No to diabete",
+           prediabete_1 == "Yes" &
+             diabete_3 == "Yes" ~ "Prediabete to diabete",
+           prediabete_1 =="Yes" &
+             prediabete_or_diabete_3 == "No" ~ "Prediabete to no",
+           diabete_1 == "Yes" & 
+             prediabete_3 == "Yes" ~ "Diabete to prediabete",
+           diabete_1 == "Yes" &
+             prediabete_or_diabete_3 == "No" ~ "Diabete to no"))  %>%
+   mutate(a1c_baseline = a1c_1,
+          a1c_fu = a1c_3,
+          og_glu_5_baseline = og_glu_5_1,
+          og_glu_5_fu = og_glu_5_3,
+          og_glu120_baseline = og_glu120_1,
+          og_glu120_fu = og_glu120_3)
+  
+missing_solar_df_w3<- solar_df_w %>%
+  filter(!is.na(og_glu_5_1) & is.na(og_glu_5_2) & 
+           is.na(og_glu_5_3) & !is.na(og_glu_5_4)) %>%
+  mutate(
+         diabete_change = case_when(
+           prediabete_or_diabete_1 == "No"&
+             prediabete_or_diabete_4 == "No" ~ "No to no",
+           prediabete_1 == "Yes" & 
+             prediabete_4 == "Yes" ~ "Prediabete to prediabete",
+           diabete_1 == "Yes" &
+             diabete_4 == "Yes" ~ "Diabete to diabete",
+           prediabete_or_diabete_1 == "No" &
+             prediabete_4 == "Yes" ~ "No to prediabete",
+           prediabete_or_diabete_1 == "No" &
+             diabete_4 == "Yes" ~ "No to diabete",
+           prediabete_1 == "Yes" &
+             diabete_4 == "Yes" ~ "Prediabete to diabete",
+           prediabete_1 =="Yes" &
+             prediabete_or_diabete_4 == "No" ~ "Prediabete to no",
+           diabete_1 == "Yes" & 
+             prediabete_4 == "Yes" ~ "Diabete to prediabete",
+           diabete_1 == "Yes" &
+             prediabete_or_diabete_4 == "No" ~ "Diabete to no")) %>%
+   mutate(a1c_baseline = a1c_1,
+          a1c_fu = a1c_4,
+          og_glu_5_baseline = og_glu_5_1,
+          og_glu_5_fu = og_glu_5_4,
+          og_glu120_baseline = og_glu120_1,
+          og_glu120_fu = og_glu120_4)
+
+missing_solar_df_w4<- solar_df_w %>%
+  filter(!is.na(og_glu_5_1) & is.na(og_glu_5_2) & 
+           is.na(og_glu_5_3) & is.na(og_glu_5_4) &
+           !is.na(og_glu_5_5)) %>%
+  mutate(
+         diabete_change = case_when(
+           prediabete_or_diabete_1 == "No"&
+             prediabete_or_diabete_5 == "No" ~ "No to no",
+           prediabete_1 == "Yes" & 
+             prediabete_5 == "Yes" ~ "Prediabete to prediabete",
+           diabete_1 == "Yes" &
+             diabete_5 == "Yes" ~ "Diabete to diabete",
+           prediabete_or_diabete_1 == "No" &
+             prediabete_5 == "Yes" ~ "No to prediabete",
+           prediabete_or_diabete_1 == "No" &
+             diabete_5 == "Yes" ~ "No to diabete",
+           prediabete_1 == "Yes" &
+             diabete_5 == "Yes" ~ "Prediabete to diabete",
+           prediabete_1 =="Yes" &
+             prediabete_or_diabete_5 == "No" ~ "Prediabete to no",
+           diabete_1 == "Yes" & 
+             prediabete_5 == "Yes" ~ "Diabete to prediabete",
+           diabete_1 == "Yes" &
+             prediabete_or_diabete_5 == "No" ~ "Diabete to no"))  %>%
+   mutate(a1c_baseline = a1c_1,
+          a1c_fu = a1c_5,
+          og_glu_5_baseline = og_glu_5_1,
+          og_glu_5_fu = og_glu_5_5,
+          og_glu120_baseline = og_glu120_1,
+          og_glu120_fu = og_glu120_5)
+
+missing_solar_df_w5<- solar_df_w %>%
+  filter(!is.na(og_glu_5_1) & is.na(og_glu_5_2) & 
+           is.na(og_glu_5_3) & is.na(og_glu_5_4) &
+           is.na(og_glu_5_5) & !is.na(og_glu_5_6)) %>%
+    mutate(
+         diabete_change = case_when(
+           prediabete_or_diabete_1 == "No"&
+             prediabete_or_diabete_6 == "No" ~ "No to no",
+           prediabete_1 == "Yes" & 
+             prediabete_6 == "Yes" ~ "Prediabete to prediabete",
+           diabete_1 == "Yes" &
+             diabete_6 == "Yes" ~ "Diabete to diabete",
+           prediabete_or_diabete_1 == "No" &
+             prediabete_6 == "Yes" ~ "No to prediabete",
+           prediabete_or_diabete_1 == "No" &
+             diabete_6 == "Yes" ~ "No to diabete",
+           prediabete_1 == "Yes" &
+             diabete_6 == "Yes" ~ "Prediabete to diabete",
+           prediabete_1 =="Yes" &
+             prediabete_or_diabete_6 == "No" ~ "Prediabete to no",
+           diabete_1 == "Yes" & 
+             prediabete_6 == "Yes" ~ "Diabete to prediabete",
+           diabete_1 == "Yes" &
+             prediabete_or_diabete_6 == "No" ~ "Diabete to no"))  %>%
+   mutate(a1c_baseline = a1c_1,
+          a1c_fu = a1c_6,
+          og_glu_5_baseline = og_glu_5_1,
+          og_glu_5_fu = og_glu_5_6,
+          og_glu120_baseline = og_glu120_1,
+          og_glu120_fu = og_glu120_6)
+
+missing_solar_df_w6<- solar_df_w %>%
+  filter(!is.na(og_glu_5_1) & is.na(og_glu_5_2) & 
+           is.na(og_glu_5_3) & is.na(og_glu_5_4) &
+           is.na(og_glu_5_5) & is.na(og_glu_5_6) &
+           !is.na(og_glu_5_7)) %>%
+    mutate(
+         diabete_change = case_when(
+           prediabete_or_diabete_1 == "No"&
+             prediabete_or_diabete_7 == "No" ~ "No to no",
+           prediabete_1 == "Yes" & 
+             prediabete_7 == "Yes" ~ "Prediabete to prediabete",
+           diabete_1 == "Yes" &
+             diabete_7 == "Yes" ~ "Diabete to diabete",
+           prediabete_or_diabete_1 == "No" &
+             prediabete_7 == "Yes" ~ "No to prediabete",
+           prediabete_or_diabete_1 == "No" &
+             diabete_7 == "Yes" ~ "No to diabete",
+           prediabete_1 == "Yes" &
+             diabete_7 == "Yes" ~ "Prediabete to diabete",
+           prediabete_1 =="Yes" &
+             prediabete_or_diabete_7 == "No" ~ "Prediabete to no",
+           diabete_1 == "Yes" & 
+             prediabete_7 == "Yes" ~ "Diabete to prediabete",
+           diabete_1 == "Yes" &
+             prediabete_or_diabete_7 == "No" ~ "Diabete to no")) %>%
+   mutate(a1c_baseline = a1c_1,
+          a1c_fu = a1c_7,
+          og_glu_5_baseline = og_glu_5_1,
+          og_glu_5_fu = og_glu_5_7,
+          og_glu120_baseline = og_glu120_1,
+          og_glu120_fu = og_glu120_7)
+
+solar_df_w1 <- solar_df_w1 %>% 
+  filter(!id %in% missing_solar_df_w$id & 
+           !id %in% missing_solar_df_w2$id & 
+           !id %in% missing_solar_df_w3$id &
+           !id %in% missing_solar_df_w4$id &
+           !id %in% missing_solar_df_w5$id &
+           !id %in% missing_solar_df_w6$id) %>% 
+  bind_rows(missing_solar_df_w) %>%
+  bind_rows(missing_solar_df_w2) %>%
+  bind_rows(missing_solar_df_w3) %>%
+  bind_rows(missing_solar_df_w4) %>%
+  bind_rows(missing_solar_df_w5) %>%
+  bind_rows(missing_solar_df_w6) 
+```
+
+## solar remission/incidence definition
+
+```{r}
+table1::table1(~diabete_change, solar_df_w1)
+
+solar_df_w2 <- inner_join(solar_df_w1, solar_ft, by = "id")
+
+solar_df_w3 <- solar_df_w2 %>%
+  dplyr::mutate(
+    diabetes_remission = case_when(
+      diabete_change == "Diabete to prediabete" ~ "Yes",
+      diabete_change == "Diabete to no" ~ "Yes",
+      diabete_change == "Diabete to diabete" ~ "No",
+      diabete_change == "Prediabete to no" ~ "Yes",
+      diabete_change == "Prediabete to prediabete" ~ "No",
+      .default = NA_character_
+    )
+  )  
+
+solar_df_re <- solar_df_w3 %>%
+  drop_na(diabetes_remission) 
+
+table1::table1(~diabete_change, solar_df_re)
+```
+
+## prediction performance in Solar
+
+```{r}
+
+fs_bs_tsk = as_task_classif(x = solar_df_re,
+                            target = "diabetes_remission",positive = "No", id = "feature selection")
+
+fs_bs_tsk$select(selected_proteins[selected_proteins != "sit1"]) # sit1 is not present
+fs_bs_tsk$feature_names
+
+#present <- selected_proteins %in% colnames(solar_df_re)
+fs_bs_tsk$col_roles$stratum <- fs_bs_tsk$target_names # make sure each statum has the same ratio
+
+# combine learner with pipeline
+logic_over <- as_learner(lrn("classif.log_reg", predict_type = "prob"))
+
+
+protein_combo_solar <- protein_combo[!grepl("sit1", protein_combo)]
+results <- list()
+
+for(combo in protein_combo_solar) {
+  subset_tsk <- fs_bs_tsk$clone()$select(combo)
+  subset_tsk$col_roles$stratum <- subset_tsk$target_names
+  rr <- resample(task = subset_tsk, learner = logic_over, resampling = rsmp("cv", folds = 5), store_models = TRUE)  
+   prauc <- rr$aggregate(msr("classif.prauc"))
+   auc <- rr$aggregate(msr("classif.auc"))
+   fbeta <- rr$aggregate(msr("classif.fbeta", beta = 2))
+  results[[paste(combo, collapse = " + ")]] <- list(prauc = prauc, auc = auc,
+                                                    fbeta = fbeta)
+}
+
+results_df <- do.call(rbind, lapply(names(results), function(combo) {
+  data.frame(Features = combo, PRAUC = results[[combo]]$prauc, AUC = results[[combo]]$auc,
+             fbeta = results[[combo]]$fbeta)
+}))
+
+# Sort the data frame by the AUC column in descending order
+df_sorted <- results_df %>%
+  arrange(desc(PRAUC))
+
+# Create a flextable, round numeric columns to 3 decimal places, and autofit
+ft <- df_sorted %>%
+  flextable() %>%
+  colformat_double(digits = 3) %>%
+  autofit()
+ft
+ #write_csv(results_df, fs::path(dir_figures,"bma_solar_remission_prediction_ukb_012025.csv"))
+```

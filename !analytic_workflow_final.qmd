@@ -1,0 +1,1150 @@
+---
+title: "Monitoring proteomic biomarkers for HbA1C and HOMA-IR in Teen-LABS"
+author: "Zhenjiang Li"
+date: today
+toc: true
+toc_expand: 2
+format: 
+  html:
+    code-fold: true
+    html-math-method: katex
+    fontsize: 16pt
+    grid:
+      sidebar-width: 0px
+      body-width: 1500px
+      margin-width: 500px
+      gutter-width: 1.5rem
+embed-resources: true
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+## Environment Setup {.hidden}
+
+```{=html}
+<style type="text/css">
+caption, .table-caption {
+  text-align: left;
+}
+</style>
+```
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+
+options(scipen=999)
+source(here::here("1_Scripts", "!libraries.R"))
+source(here::here("1_Scripts", "!functions.R"))
+source(here::here("1_Scripts", "!directories.R"))
+source(here::here("1_Scripts", "!load_data.R"))
+source(here::here("1_Scripts", "!preprocess_data.R"))
+
+library(survival)
+library(table1)
+library(stringdist)
+```
+
+```{r}
+#| label: shorten-long-path
+#| include: false
+
+create_shortcut <- function(path, short_cut, drive)
+{
+  return(
+    sub(gsub("\\)", "\\\\)", gsub("\\(", "\\\\(", short_cut)), paste0(drive, ":"), path))
+}
+
+if(nchar(dir_data) > 80)
+{
+  system("subst x: /D")
+  short_cut <- dir_home |> dirname()
+  system(paste0("subst x: \"", short_cut, "\""))
+  
+  dir_objects_names <- ls(pattern = "^dir_")
+  
+  dir_list <- mget(dir_objects_names)
+  
+  dir_list_shortened <- lapply(
+    dir_list,
+    function(y) create_shortcut(y, short_cut, "x")
+  )
+  list2env(dir_list_shortened, envir = .GlobalEnv)  
+}
+
+rm(dir_objects_names, short_cut, dir_list, dir_list_shortened)
+```
+
+## Model Parameters
+
+```{r}
+outcome_num <- c("hba1c", "homa")
+outcome_binary <- c("diabetes_remission")
+covariates <- c("age_baseline", "sex", "race_binary", "parents_income", "site", "diab_med", "bmi_baseline")
+covariates_reduced <- c("age_baseline", "sex", "race_binary", "parents_income", "bmi_baseline")
+
+p_adjust_threshold <- 0.05
+missing_threshold <- 0.2
+```
+
+## Preprocess Working Data
+
+### Create PWAS data
+
+```{r}
+assay_missing <- tl_proteomics_property %>% 
+  dplyr::filter(MissingFreq > missing_threshold) %>% 
+  dplyr::select(Assay) %>% unlist %>% as.character() %>% 
+  tolower %>% gsub("-", "_", .)
+
+working_data <- left_join(
+  data %>% 
+    dplyr::select(key, visit, 
+                  all_of(outcome_num), 
+                  # all_of(outcome_binary), 
+                  all_of(covariates),
+                  t2d), # assay named PROC
+  tl_proteomics_NPX %>% 
+    dplyr::select(-all_of(assay_missing)),
+  by = c("key", "visit")
+) %>% 
+  dplyr::filter(visit != 5) %>% 
+  drop_na(all_of(covariates))
+
+assays <- colnames(tl_proteomics_NPX %>%
+                     dplyr::select(-all_of(assay_missing)))[-c(1:2)]
+```
+
+## Table 1
+
+```{r}
+table1_input <- left_join(
+  data %>% 
+    dplyr::select(key, visit, 
+                  all_of(outcome_num), 
+                  # all_of(outcome_binary), 
+                  all_of(covariates),
+                  t2d), # assay named PROC
+  tl_proteomics_NPX %>% 
+    dplyr::select(-all_of(assay_missing)),
+  by = c("key", "visit")
+) %>% 
+  dplyr::filter(visit != 5) %>% 
+  dplyr::mutate(
+    diab_med = as.factor(diab_med)
+  ) %>% 
+  drop_na(age_baseline) %>% 
+  dplyr::filter(visit == 0)
+
+monitor_include <- table1_input$key |> unique()
+
+table1(
+  as.formula(paste(
+    "~", paste(c(covariates, "t2d"), collapse = " + ")
+  )),
+  data = table1_input)
+
+prop.table(table(table1_input[,c(covariates[4])])) |> round(3)
+prop.table(table(table1_input[,c(covariates[6])])) |> round(3)
+prop.table(table(table1_input[,"t2d"])) |> round(3)
+
+table1(
+  as.formula(paste(
+    "~", paste(c("hba1c", "homa"), collapse = " + "),
+    "| as.factor(visit)"
+  )),
+  data = data %>% filter(key %in% monitor_include))
+```
+
+## Table 2
+
+```{r}
+bma_include <- data %>%
+  dplyr::filter(visit %in% c(0,5)) %>% 
+  dplyr::select(key, visit, t2d, diab_med) %>% 
+  pivot_wider(
+    names_from = visit, 
+    values_from = c(t2d, diab_med), 
+    names_prefix = "visit_") %>%
+  dplyr::mutate(
+    diabetes_remission = case_when(
+      t2d_visit_0 == "Diabetes" & t2d_visit_5 == "Prediabetes" ~ "Yes",
+      t2d_visit_0 == "Diabetes" & t2d_visit_5 == "No" ~ "Yes",
+      t2d_visit_0 == "Diabetes" & t2d_visit_5 == "Diabetes" ~ "No",
+      t2d_visit_0 == "Prediabetes" & t2d_visit_5 == "No" ~ "Yes",
+      t2d_visit_0 == "Prediabetes" & t2d_visit_5 == "Prediabetes" ~ "No",
+      .default = NA_character_
+    )
+  ) %>%
+  dplyr::select(key, diabetes_remission) %>%
+  drop_na(diabetes_remission)  %>% 
+  inner_join(
+    .,
+    tl_proteomics_NPX%>%
+      dplyr::filter(visit == 0) %>% 
+      dplyr::select(-all_of(assay_missing)),
+    by = c("key")) %>% 
+  dplyr::mutate(
+    across(everything(),
+           ~ ifelse(is.na(.), mean(., na.rm = T), .))
+  ) %>% 
+  dplyr::mutate(
+    diabetes_remission = as.factor(diabetes_remission)
+  ) %>%
+  dplyr::select(key) %>% unlist %>% as.character
+
+table2_input <- data %>% 
+  dplyr::filter(visit %in% c(0,5)) %>% 
+  dplyr::filter(key %in% bma_include) %>% 
+  dplyr::select(key, visit, fpg, hba1c, diab_med, homa, t2d, diabetes_remission) %>% 
+  dplyr::mutate(
+    diab_med = as.factor(diab_med))
+  
+table1(
+  as.formula(paste(
+    "~", paste(c("fpg", "hba1c", "diab_med", "homa", "t2d"), collapse = " + "),
+    "| as.factor(visit)"
+  )),
+  data = table2_input)
+
+table(table2_input$diabetes_remission, exclude = F)
+prop.table(table(table2_input$diabetes_remission)) |> round(2) |> format(nsmall = 2)
+```
+
+## Table S1
+
+```{r}
+table1_input <- table1_input %>% 
+  dplyr::mutate(
+    all_vs_bma = if_else(key %in% bma_include, "bma", "all")
+  )
+
+table1(
+  as.formula(paste(
+    "~", paste(c(covariates), collapse = " + "),
+    "| all_vs_bma"
+  )),
+  data = table1_input,
+  overall=F, extra.col=list(`P-value`=pvalue))
+```
+
+## Linear Mixed Effect Model
+
+```{r}
+#| eval: false
+
+numCores <- detectCores() - 2  # Use all but one core
+cl <- makeCluster(numCores)
+registerDoParallel(cl)
+
+model_summary <- foreach(y = outcome_num, .combine = rbind, .packages = c("lme4", "lmerTest", "dplyr")) %:%
+  foreach(x = assays, .combine = rbind) %dopar% {
+    fit_lmm(x, y, covariates, working_data)
+  }
+
+stopCluster(cl)
+
+saveRDS(
+  model_summary,
+  fs::path(
+    dir_project,
+    "0_Data",
+    "LMM_model_summary_hba1c_homa_num.RDS"
+  ))
+```
+
+```{r}
+#| label: load LMM model results
+
+model_summary <- readRDS(
+  fs::path(
+    dir_project,
+    "0_Data",
+    "LMM_model_summary_hba1c_homa_num.RDS"
+  ))
+```
+
+```{r}
+model_summary <- model_summary %>% 
+  dplyr::group_by(outcome) %>% 
+  dplyr::mutate(
+    p_adjust = p.adjust(pvalue, method = "bon"),
+    significance = case_when(
+      p_adjust < p_adjust_threshold ~ "q value < 0.05",
+      TRUE ~ "Null"
+      ),
+    show_name = gsub("_", "-", toupper(assay)),
+    label = if_else(
+      rank(abs(pvalue)) <= 10, 
+      as.character(show_name),
+      NA)
+  ) %>% 
+  ungroup()
+```
+
+### Summary of assays
+
+```{r}
+model_summary %>% 
+  dplyr::group_by(outcome) %>% 
+  dplyr::reframe(
+    N_sig = sum(p_adjust < p_adjust_threshold, na.rm = T)
+  ) %>% 
+  kbl(col.names = c("Outcome", "N. of significant proteins")) %>% 
+  kable_paper("hover", full_width = F)
+
+sig_assays <- modify(
+  model_summary %>% split(.$outcome),
+  ~ .x$show_name[which(.x$p_adjust < p_adjust_threshold)]
+)
+
+sig_assays_shared <- Reduce(intersect, sig_assays)
+```
+
+As a result, there are **`r length(sig_assays_shared)`** assays significantly associated with all `r length(outcome_num)` glycemic markers after multiple comparison correction.
+
+#### Volcano plot
+
+```{r}
+#| warning: false
+#| message: false
+#| fig-width: 8
+#| fig-height: 6
+
+plot_list <- lapply(
+  outcome_num,
+  function(x)
+    make_volcano(x, model_summary)
+)
+
+plot_grid(
+  plotlist = plot_list,
+  nrow = 1,
+  ncol = 2,
+  byrow = T,
+  align = "hv",
+  labels = c("A.", "B."),
+  label_size = unit(11, units = "pt")
+)
+
+ggsave(
+  fs::path(
+    dir_figure,
+    "Volcano plots for HbA1c and HOMA-IR.png"
+  ),
+  width = 8,
+  height = 3,
+  units = "in"
+)
+```
+
+### Col plot for monitoring proteins
+
+#### Protein annotation
+
+```{r}
+#| label: create a wide dataframe for annotation of both HbA1c and HOMA-IR
+
+sig_assays_union <- unique(unlist(sig_assays))
+
+sig_assays_wide <- data.frame(
+  Symbol = sig_assays_union,
+  HbA1c = as.integer(sig_assays_union %in% sig_assays$hba1c),
+  HOMA_IR = as.integer(sig_assays_union %in% sig_assays$homa)
+)
+
+sig_assays_wide <- sig_assays_wide |> 
+  left_join(
+    gene_list,
+    by = "Symbol"
+  )
+```
+
+```{r}
+#| label: identify proteins not in KEGG database
+
+assay_nofound <- sig_assays_wide$Symbol[is.na(sig_assays_wide$PathwayID)]
+for(i in 1:length(assay_nofound))
+{
+  assay_sub <- str_extract(assay_nofound[i], "^\\D+")
+  if(nchar(assay_sub) >= 3)
+  {
+    assay_match <- grep(
+      paste0("^", assay_sub),
+      gene_list$Symbol,
+      ignore.case = T, value = T)    
+  }else{
+    assay_match <- grep(
+      paste0("^", substr(assay_nofound[i], 1, 4)),
+      gene_list$Symbol,
+      ignore.case = T, value = T)    
+  }
+
+  if(length(assay_match) == 0)
+  {
+    cat("\nNo fuzzy match was found in KEGG pathway database for **", assay_nofound[i], "**.\n", sep = "")
+  }else{
+    cat("\nFuzzy Matches in KEGG pathway database for **", assay_nofound[i], "** are:\n", paste(assay_match, collapse = ", "), "\n", sep = "")
+  }
+}
+```
+
+```{r}
+#| label: mannual annotate proteins using reactome database
+
+sig_assays_wide <- sig_assays_wide %>% 
+  dplyr::mutate(
+    Description = case_when(
+      # re-label KEGG-database-matched protein
+      Symbol == "PCSK9" ~ "Post-translational protein phosphorylation",
+      Symbol == "LDLR" ~ "Clathrin-mediated endocytosis",
+      Symbol == "LPL" ~ "Metabolism of fat-soluble vitamins",
+      .default = Description
+    ),
+    pathway_select = case_when(
+      Symbol == "CST7" ~ "Others",
+      Symbol == "OMD" ~ "Glycosaminoglycan metabolism",
+      Symbol == "SMOC2" ~ "Others",
+      Symbol == "CRELD2" ~ "Others",
+      Symbol == "ESM1" ~ "Others",
+      Symbol == "PON3" ~ "Arachidonate metabolism",
+      Symbol == "TFF2" ~ "Others",
+      Symbol == "IGFBPL1" ~ "Post-translational protein phosphorylation",
+      Symbol == "CLEC5A" ~ "Neutrophil degranulation",
+      Symbol == "SSC4D" ~ "Others",
+      Symbol == "SIGLEC7" ~ "Immunoregulatory interactions",
+      Symbol == "ANGPTL1" ~ "Others",
+      Symbol == "CCDC80" ~ "Others",
+      Symbol == "FAM3C" ~ "Platelet degranulation",
+      Symbol == "MEGF9" ~ "Others",
+      Symbol == "DLK1" ~ "Signaling by NOTCH",
+      Symbol == "CCN3" ~ "Signaling by NOTCH",
+      Symbol == "FAP" ~ "Glycerolipid metabolism",
+      Symbol == "SSC5D" ~ "Binding and uptake of ligands by scavenger receptors",
+      Symbol == "ITIH3" ~ "Platelet degranulation",
+      Symbol == "CD163" ~ "Binding and uptake of ligands by scavenger receptors",
+      Symbol == "C1QTNF1" ~ "Others",
+      Symbol == "RARRES2" ~ "Platelet degranulation",
+      Symbol == "CHI3L1" ~ "Neutrophil degranulation",
+      .default = NA_character_
+    ),
+    parent_pathway = case_when(
+      pathway_select == "Others" ~ "Others",
+      pathway_select == "Glycosaminoglycan metabolism" ~ "Carbohydrate metabolism",
+      pathway_select == "Arachidonate metabolism" ~ "Lipid metabolism",
+      pathway_select == "Post-translational protein phosphorylation" ~ "Others",
+      pathway_select == "Immunoregulatory interactions" ~ "Immune system",
+      pathway_select == "Platelet degranulation" ~ "Immune system",
+      pathway_select == "Signaling by NOTCH" ~ "Signal transduction",
+      pathway_select == "Glycerolipid metabolism" ~ "Lipid metabolism",
+      pathway_select == "Binding and uptake of ligands by scavenger receptors" ~ "Vesicle-mediated transport",
+      pathway_select == "Neutrophil degranulation" ~ "Immune system",
+      pathway_select == "Clathrin-mediated endocytosis" ~ "Vesicle-mediated transport",
+      pathway_select == "Metabolism of fat-soluble vitamins" ~ "Metabolism of cofactors and vitamins",
+      .default = NA_character_
+    )
+  )
+```
+
+```{r}
+#| label: count pathways to maintain overlapping pathways 
+
+count_pathways <- function(df, columns) {
+  all_pathways <- c()  # Initialize an empty vector
+  
+  for (col in columns) {
+    if (col %in% names(df)) {
+      df[[col]] <- as.character(df[[col]])  # Ensure the column is character
+      pathways <- unlist(str_split(df[[col]], ";"))  # Split entries by ";"
+      pathways <- str_trim(pathways)  # Trim any extra spaces
+      all_pathways <- c(all_pathways, pathways)  # Combine into a single list
+    }
+  }
+  
+  # Remove NA values and count occurrences
+  pathway_counts <- table(all_pathways)
+  pathway_counts_df <- as.data.frame(pathway_counts, stringsAsFactors = FALSE)
+  
+  # Rename columns
+  colnames(pathway_counts_df) <- c("Pathway", "Count")
+  
+  # Remove NA and empty values
+  pathway_counts_df <- pathway_counts_df %>% filter(Pathway != "NA" & Pathway != "")
+  
+  # Arrange by count in descending order
+  pathway_counts_df <- pathway_counts_df %>% arrange(desc(Count))
+  
+  return(pathway_counts_df)
+}
+
+pathway_count <- count_pathways(sig_assays_wide, c("Description", "pathway_select", "parent_pathway")) %>% 
+  dplyr::filter(!(
+    Pathway %in% c(
+      "Metabolic pathways",
+      "Pathways in cancer",
+      "Human papillomavirus infection",
+      "Coronavirus disease - COVID-19",
+      "Lipid and atherosclerosis",
+      "Phagosome",
+      "Lysosome",
+      "Staphylococcus aureus infection",
+      "Tuberculosis",
+      "Kaposi sarcoma-associated herpesvirus infection",
+      "Hepatitis C",
+      "Fluid shear stress and atherosclerosis",
+      "Human cytomegalovirus infection",
+      "Hepatitis B",
+      "Influenza A",
+      "Epstein-Barr virus infection",
+      "Virion - Hepatitis viruses",
+      "Measles")
+  )) # remove disease pathways
+```
+
+```{r}
+#| label: keep only one pathway names from KEGG according to pathway count
+
+update_description <- function(df, pathway_counts_df) {
+  # Convert pathway counts to a named vector for easy lookup
+  pathway_ranks <- setNames(pathway_counts_df$Count, pathway_counts_df$Pathway)
+  
+  # Create a new column for updated descriptions
+  df <- df %>%
+    mutate(Description_new = sapply(Description, function(x) {
+      if (is.na(x) || x == "") {
+        return(NA)  # Keep NA if the description is missing
+      }
+      pathways <- unlist(str_split(x, ";")) %>% str_trim()  # Split and trim pathways
+      pathways <- pathways[pathways %in% names(pathway_ranks)]  # Keep only valid pathways
+      if (length(pathways) == 0) {
+        return(NA)  # If no valid pathways remain, return NA
+      }
+      # Select the pathway with the highest count
+      best_pathway <- pathways[which.max(pathway_ranks[pathways])]
+      return(best_pathway)
+    }))
+
+  return(df)
+}
+
+sig_assays_wide <- update_description(sig_assays_wide, pathway_count)
+```
+
+```{r}
+#| label: combine KEGG and reactome pathways
+
+merge_pathway_columns <- function(df) {
+  df <- df %>%
+    mutate(pathway_select = coalesce(Description_new, pathway_select),  # Merge New_Description into pathway_select
+           pathway_select = ifelse(is.na(pathway_select), "Others", pathway_select))  # Assign "Others" if both are NA
+  
+  return(df)
+}
+
+sig_assays_wide <- merge_pathway_columns(sig_assays_wide)
+```
+
+```{r}
+#| label: create parent pathways for showing in figure
+
+# Step 1: Define parent pathway mapping (KEGG and Reactome)
+# Manually create a mapping based on known pathway relationships
+parent_pathway_mapping <- list(
+  "Amino acid metabolism" = c(
+    "Arginine biosynthesis",
+    "Glycine, serine and threonine metabolism"
+  ),
+  "Carbohydrate metabolism" = c(
+    "Glycosaminoglycan metabolism",
+    "N-Glycan biosynthesis"
+  ),
+  "Immune system" = c(
+    "Antigen processing and presentation",
+    "Apoptosis",
+    "C-type lectin receptor signaling pathway",
+    "Complement and coagulation cascades",
+    "Immunoregulatory interactions",
+    "Natural killer cell mediated cytotoxicity",
+    "Neutrophil degranulation",
+    "Platelet degranulation"
+  ),
+  "Signal transduction" = c(
+    "AMPK signaling pathway",
+    "PI3K-Akt signaling pathway",
+    "Signaling by NOTCH",
+    "TGF-beta signaling pathway",
+    "Toll-like receptor signaling pathway"
+  ),
+  "Lipid metabolism" = c(
+    "Arachidonate metabolism",
+    "Ether lipid metabolism",
+    "Glycerolipid metabolism",
+    "Sphingolipid metabolism"
+  ),
+  "Developmental biology" = c(
+    "Axon guidance",
+    "Osteoclast differentiation"
+  ),
+  "Metabolism of cofactors and vitamins" = c(
+    "Biosynthesis of cofactors",
+    "Metabolism of fat-soluble vitamins"
+  ),
+  "Signaling molecules and interaction" = c(
+    "Cell adhesion molecules",
+    "Cytokine-cytokine receptor interaction",
+    "ECM-receptor interaction"
+  ),
+  "Xenobiotics metabolism" = c(
+    "Drug metabolism - other enzymes",
+    "Metabolism of xenobiotics by cytochrome P450"
+  ),
+  "Others" = c(
+    "Efferocytosis",
+    "Nitrogen metabolism",
+    "Post-translational protein phosphorylation",
+    "Purine metabolism",
+    "Terpenoid backbone biosynthesis"
+  ),
+  "Renin-angiotensin system" = c(
+    "Renin-angiotensin system"
+  )
+)
+
+# Convert parent_pathway_mapping into a lookup table
+parent_lookup <- stack(parent_pathway_mapping) %>%
+  dplyr::rename(pathway_select = values, Parent = ind)
+
+# Assign parent pathways, preserving existing values
+sig_assays_wide <- sig_assays_wide %>%
+  left_join(parent_lookup, by = "pathway_select") %>%
+  dplyr::mutate(
+    parent_pathway = case_when(
+      !is.na(parent_pathway) ~ parent_pathway,  # Keep existing values
+      !is.na(Parent) ~ Parent,                  # Assign new parent category if matched
+      TRUE ~ "Others"                           # Default to "Others" if no match is found
+    )
+  ) %>%
+  dplyr::select(-Parent)  # Remove the temporary column
+```
+
+#### Create bar plot input
+
+```{r}
+sig_assays_estimate <- modify(
+  model_summary %>% split(.$outcome),
+  ~ .x %>% 
+    dplyr::filter(p_adjust < p_adjust_threshold) %>% 
+    dplyr::select(outcome, assay, estimate, show_name)
+) |> bind_rows()
+```
+
+```{r}
+dot_input <- left_join(
+  sig_assays_estimate,
+  sig_assays_wide %>% 
+    dplyr::select(Symbol, pathway_select, parent_pathway),
+  by = c("show_name" = "Symbol")
+) %>% 
+  dplyr::filter(outcome == "hba1c") %>% 
+  dplyr::mutate_at(
+    .var = c("parent_pathway", "pathway_select", "show_name", "outcome"),
+    .funs = as.character
+  ) %>% 
+  dplyr::arrange(parent_pathway, show_name)
+
+pathway_order <- unique(dot_input$parent_pathway)[c(1,2,5,11,4,7,8,9,10,3,6)]
+
+dot_input$parent_pathway <- factor(
+  dot_input$parent_pathway,
+  levels = pathway_order)
+
+label_positions <- dot_input %>%
+  dplyr::group_by(parent_pathway) %>%
+  reframe(x_pos = mean(as.numeric(factor(show_name))), .groups = "drop") %>% 
+  dplyr::mutate(
+    parent_pathway_label = gsub("metabolism", "met.", parent_pathway),
+    # parent_pathway_label = gsub("system", "sys.", parent_pathway_label),
+    parent_pathway_label = gsub("Metabolism", "Met.", parent_pathway_label),
+    parent_pathway_label = case_when(
+      parent_pathway_label == "Met. of cofactors and vitamins" ~ "Met. of cofactors\nand vitamins",
+      parent_pathway_label == "Signaling molecules and interaction" ~ "Signaling molecules\nand interaction",
+      .default = parent_pathway_label
+    )
+  )
+
+y_lim <- c(-ceiling_dec(max(abs(dot_input$estimate)),2),
+           ceiling_dec(max(abs(dot_input$estimate)),2))
+
+custom_colors <- c(
+  "Amino acid metabolism" = "#1F78B4",
+  "Carbohydrate metabolism" = "#33A02C",
+  "Lipid metabolism" = "#FF7F00",
+  "Xenobiotics metabolism" = "#6A3D9A",
+  "Immune system" = "#E31A1C",
+  "Renin-angiotensin system" = "#A6CEE3",
+  "Signal transduction" = "#B2DF8A",
+  "Signaling molecules and interaction" = "#FB9A99",
+  "Vesicle-mediated transport" = "#CAB2D6",
+  "Developmental biology" = "#FDBF6F",
+  "Others" = "#999999"
+)
+
+panela <- ggplot(
+  data = dot_input,
+  aes(x = show_name, y = estimate)
+) +
+  geom_col(aes(fill = parent_pathway)) +
+  scale_y_continuous(breaks = c(-0.75, -0.6, -0.45, -0.3, -0.15, 0, 0.15, 0.3, 0.45, 0.6, 0.75),
+                     limits = c(-0.75, 0.75)) +
+  scale_fill_manual(values = custom_colors) +
+  facet_grid(parent_pathway ~ ., 
+             scales = "free_y",
+             space = "free") +
+  theme_classic() +
+  coord_flip() +
+  xlab(NULL) +
+  ylab("Effect estimate (%)") +
+  theme(
+    axis.text.x = element_text(size = 11),
+    axis.title = element_text(size = 11),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.line.y = element_blank(),
+    strip.text = element_blank(),
+    legend.position = "none"
+  ) +
+  geom_text(
+    data = label_positions,
+    aes(x = x_pos, y = -0.5, label = parent_pathway_label),
+    inherit.aes = FALSE,
+    size = 11*0.35
+  ) +
+  geom_text(
+    aes(y = 0, label = show_name),  # Position text at y = 0
+    inherit.aes = TRUE,
+    size = 6*0.35,  # Adjust size if needed
+    hjust = 0.5,  # Center alignment
+    vjust = 0.35,  # Adjust positioning
+    fontface = "bold"
+  )
+```
+
+```{r}
+dot_input <- left_join(
+  sig_assays_estimate,
+  sig_assays_wide %>% 
+    dplyr::select(Symbol, pathway_select, parent_pathway),
+  by = c("show_name" = "Symbol")
+) %>% 
+  dplyr::filter(outcome == "homa") %>% 
+  dplyr::mutate_at(
+    .var = c("parent_pathway", "pathway_select", "show_name", "outcome"),
+    .funs = as.character
+  ) %>% 
+  dplyr::arrange(parent_pathway, show_name)
+
+pathway_order <- unique(dot_input$parent_pathway)[c(2,3,6,1,5,4)]
+
+dot_input$parent_pathway <- factor(
+  dot_input$parent_pathway,
+  levels = pathway_order)
+
+label_positions <- dot_input %>%
+  dplyr::group_by(parent_pathway) %>%
+  reframe(x_pos = mean(as.numeric(factor(show_name))), .groups = "drop") %>% 
+  dplyr::mutate(
+    parent_pathway_label = gsub("metabolism", "met.", parent_pathway),
+    # parent_pathway_label = gsub("system", "sys.", parent_pathway_label),
+    parent_pathway_label = gsub("Metabolism", "Met.", parent_pathway_label),
+    parent_pathway_label = case_when(
+      parent_pathway_label == "Met. of cofactors and vitamins" ~ "Met. of cofactors\nand vitamins",
+      parent_pathway_label == "Signaling molecules and interaction" ~ "Signaling molecules\nand interaction",
+      .default = parent_pathway_label
+    )
+  )
+
+y_lim <- c(-ceiling_dec(max(abs(dot_input$estimate)),2),
+           ceiling_dec(max(abs(dot_input$estimate)),2))
+
+custom_colors <- c(
+  "Lipid metabolism" = "#FF7F00",
+  "Metabolism of cofactors and vitamins" = "#8C564B",
+  "Xenobiotics metabolism" = "#6A3D9A",
+  "Immune system" = "#E31A1C",
+  "Signaling molecules and interaction" = "#FB9A99",
+  "Others" = "#999999"
+)
+
+panelb <- ggplot(
+  data = dot_input,
+  aes(x = show_name, y = estimate)
+) +
+  geom_col(aes(fill = parent_pathway)) +
+  scale_y_continuous(breaks = seq(-7.5,7.5,by = 1.5),
+                     limits = c(-7.5, 7.5)) +
+  scale_fill_manual(values = custom_colors) +
+  facet_grid(parent_pathway ~ ., 
+             scales = "free_y",
+             space = "free") +
+  theme_classic() +
+  coord_flip() +
+  xlab(NULL) +
+  ylab("Effect estimate") +
+  theme(
+    axis.text = element_text(size = 11),
+    axis.title = element_text(size = 11),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.line.y = element_blank(),
+    strip.text = element_blank(),
+    legend.position = "none"
+  ) +
+  # geom_text(
+  #   data = label_positions,
+  #   aes(x = x_pos, y = 6.5, label = parent_pathway_label),
+  #   inherit.aes = FALSE,
+  #   size = 11*0.35
+  # ) +
+  geom_text(
+    aes(y = 0, label = show_name),  # Position text at y = 0
+    inherit.aes = TRUE,
+    size = 6*0.35,  # Adjust size if needed
+    hjust = 0.5,  # Center alignment
+    vjust = 0.35,  # Adjust positioning
+    fontface = "bold"
+  )
+```
+
+```{r}
+png(
+  fs::path(
+    dir_figure,
+    "Figure 1.png"
+  ),
+  height = 8, width = 5, unit = "in", res = 300
+)
+plot_grid(
+  panela,
+  panelb,
+  ncol = 1,
+  rel_heights = c(84,20),
+  align = "v",
+  axis = "lb"
+)
+dev.off()
+```
+
+### Pathway enrichment analysis
+
+```{r}
+#| label: prepare input data for ORA
+#| message: false
+
+path_enrich_input <- model_summary %>%
+  mutate(
+    UniProt = tl_proteomics_property$UniProt[match(show_name, tl_proteomics_property$Assay)]
+  ) %>% 
+  dplyr::select(outcome, UniProt, show_name, estimate, p_adjust) %>%
+  split(.$outcome)
+path_enrich_input <- modify(
+  path_enrich_input,
+  ~ .x %>% 
+    mutate(
+       entrez_ID = mapIds(
+         org.Hs.eg.db, keys = UniProt,
+         column = "ENTREZID", keytype = "UNIPROT", multiVals = "first"
+         )
+    )
+)
+
+path_enrich_input <- modify(
+  path_enrich_input,
+  ~ .x %>% 
+    drop_na(entrez_ID) %>% 
+    dplyr::filter(p_adjust < p_adjust_threshold)
+)
+
+entrez_ID_list <- modify(
+  path_enrich_input,
+  ~ .x %>% 
+    dplyr::select(entrez_ID) %>% 
+    unlist
+)
+```
+
+```{r}
+#| message: false
+
+pathway_output_l <- lapply(
+  entrez_ID_list,
+  function(x)
+    enrichKEGG(gene = x, organism = "hsa", pvalueCutoff = 0.05,
+               pAdjustMethod = "BH", qvalueCutoff = 0.05) |>
+    as.data.frame()
+)
+```
+
+```{r}
+#| results: asis
+
+lapply(
+  pathway_output_l, 
+  function(x)
+    x %>% 
+    kbl() %>% 
+    kable_paper("hover", full_width = F))
+```
+
+#### Pathway plot
+
+```{r}
+plot_input <- modify(
+  pathway_output_l,
+  ~ .x %>% 
+    dplyr::filter(category != "Human Diseases") %>%
+    dplyr::mutate(
+      enrichment = sapply(GeneRatio, function(x) {
+        parts <- strsplit(x, "/")[[1]]
+        as.numeric(parts[1]) / as.numeric(parts[2])
+        })
+      )
+) %>% 
+  modify2(
+    names(.),
+    ~ .x %>% 
+      dplyr::mutate(
+        outcome = .y
+      )
+  ) %>% bind_rows()
+```
+
+```{r}
+#| fig-width: 9
+#| fig-height: 3.5
+
+ggplot(
+  data = plot_input,
+  aes(x = interaction(Description, subcategory),
+      y = -log10(qvalue),
+      fill = enrichment)
+) +
+  geom_bar(stat = "identity") +
+  geom_hline(yintercept = -log10(0.05), color = "red", lty = "dashed") +
+  coord_flip() +
+  facet_grid(outcome ~ ., space = "free", scales = "free_y",
+             labeller = as_labeller(c(
+               "fpg" = "Fasting glucose",
+               "hba1c" = "HbA1c",
+               "homa" = "HOMA-IR",
+               "ins" = "Fasting insulin"))) +
+  scale_x_discrete(labels = make_labels) +
+  scale_fill_gradient(
+    high = "#132B43",
+    low = "#56B1F7",
+    labels = scales::percent,
+    name = "Enrichment") +
+  ylab(expression("-"~log[10]~"(adjusted p-values)")) +
+  xlab(NULL) +
+  theme_classic() +
+  theme(
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 11),
+    panel.background = element_rect(fill = "grey95"),
+    legend.text = element_text(size = 9),
+    legend.title = element_text(size = 10),
+    strip.text = element_text(size = 9),
+    legend.position = "bottom",
+    legend.justification="left",
+    legend.margin = ggplot2::margin(0,0,0,0),
+    legend.box.margin=ggplot2::margin(-10,-10,0,-100),
+    legend.key.height = unit(11, "pt"),
+    legend.key.width = unit(30, "pt")
+  )
+
+ggsave(
+  fs::path(
+    dir_figure,
+    "pathway_enrichment_hba1c_homa_num.png"
+  ),
+  width = 7,
+  height = 3,
+  unit = "in", dpi = 600
+)
+```
+
+## Prognostic Biomarker Discovery
+
+```{r}
+protein_bf10 <- c("tnfrsf11b","hsd11b1","c1qa","cd6","il10ra","sit1","lepr","timd4","siglec1","epo","pla2g1b","icam2","dctpp1","lilrb1")
+```
+
+```{r overlap with monitoring biomarkers}
+lapply(
+  sig_assays,
+  function(x)
+    intersect(x, toupper(protein_bf10))
+)
+
+fuzzy_matches <- modify(
+  sig_assays,
+  ~ sapply(.x, function(y) fuzzy_match(y, toupper(protein_bf10), 0.15))
+) |>
+  lapply(function(x) x[!is.na(x)])
+```
+
+## Survival Model
+
+```{r}
+t2d_include <- data %>% 
+  dplyr::filter(visit == 0) %>% 
+  dplyr::filter(t2d %in% c("Diabetes", "Prediabetes")) %>% 
+  dplyr::select(key) %>% unlist %>% unique
+
+working_data_surv <- data %>%
+  dplyr::filter(key %in% t2d_include) %>%
+  dplyr::arrange(key, visit) %>% 
+  dplyr::group_by(key) %>%
+    dplyr::mutate(
+    time_start = lag(visit),
+    time_end = visit
+  ) %>% 
+  dplyr::slice(seq(match(1, diabetes_remission, nomatch = n()))) %>%
+  ungroup() %>% 
+  dplyr::mutate(
+    diabetes_remission = ifelse(is.na(diabetes_remission), 0,
+                                ifelse(diabetes_remission == 0, 0, 1))
+  ) %>% 
+  dplyr::select(key, visit, time_start, time_end,
+                diabetes_remission,
+                all_of(covariates)) %>% 
+  dplyr::filter(!is.na(time_start)) %>% 
+  inner_join(
+    tl_proteomics_NPX %>%
+      dplyr::arrange(key, visit) %>% 
+      dplyr::select(-all_of(assay_missing)) %>% 
+      dplyr::mutate(
+        time_start = visit,
+        time_end = case_when(
+          visit == 3 ~ 5,
+          visit == 1 ~ 3,
+          visit == 0.5 ~ 1,
+          visit == 0 ~ 0.5,
+          .default = NA
+        )
+      ),
+    by = c("key", "time_start", "time_end")
+  )
+```
+
+```{r}
+#| eval: false
+
+numCores <- detectCores() - 2  # Use all but one core
+cl <- makeCluster(numCores)
+registerDoParallel(cl)
+
+model_summary <- foreach(y = "diabetes_remission", .combine = rbind, .packages = c("survival", "dplyr")) %:%
+  foreach(x = assays, .combine = rbind) %dopar% {
+    fit_cox(x, y, covariates, working_data_surv)
+  }
+
+stopCluster(cl)
+
+saveRDS(
+  model_summary,
+  fs::path(
+    dir_project,
+    "0_Data",
+    "COX_model_summary_diabetes_remission.RDS"
+  ))
+```
+
+```{r}
+#| label: load COX model results
+
+model_summary <- readRDS(
+  fs::path(
+    dir_project,
+    "0_Data",
+    "COX_model_summary_diabetes_remission.RDS"
+  ))
+```
+
+```{r}
+model_summary <- model_summary %>% 
+  dplyr::mutate(
+    p_adjust = p.adjust(pvalue, method = "bon"),
+    significance = case_when(
+      p_adjust < p_adjust_threshold ~ "q value < 0.05",
+      TRUE ~ "Null"
+      ),
+    show_name = gsub("_", "-", toupper(assay)),
+    label = if_else(
+      rank(abs(pvalue)) <= 10, 
+      as.character(show_name),
+      NA)
+  )
+```
+
+### Summary of assays
+
+```{r}
+model_summary %>% 
+  dplyr::reframe(
+    outcome = "Diabetes remission at 3y",
+    N_sig = sum(p_adjust < p_adjust_threshold, na.rm = T)
+  ) %>% 
+  kbl(col.names = c("Outcome", "N. of significant proteins")) %>% 
+  kable_paper("hover", full_width = F)
+```
+
+#### Volcano plot
+
+```{r}
+#| warning: false
+#| message: false
+#| fig-width: 4
+#| fig-height: 6
+
+mycolors <- c("red", "grey")
+names(mycolors) <- c("q value < 0.05", "Null")
+
+max_abs_val <- max(abs(model_summary$estimate))
+
+ggplot(
+    data = model_summary,
+    aes(x = estimate, y = -log10(pvalue),
+        col = significance,
+        label = label
+    )) + 
+    geom_point() +
+    geom_hline(yintercept = -log10(0.05/dim(model_summary)[1]),
+               color = "red", lty = "dashed") +
+    geom_hline(yintercept = -log10(0.05),
+               color = "blue", lty = "dashed") +
+    xlim(-max_abs_val, max_abs_val) +
+    ylab(expression(-log[10]~"(p)")) +
+    xlab("Log of hazard ratios of diabetes remission") +
+    theme_classic() +
+    geom_text_repel(max.overlaps = 100, size = 2.5)  +
+    scale_colour_manual(values = mycolors) +
+    theme(plot.caption = element_text(hjust = 0),
+          legend.position = "none",
+          legend.title = element_blank(),
+          text = element_text(size = 11, family = "sans"),
+          axis.text = element_text(size = 11),
+          axis.title = element_text(
+            size = 11,
+            margin = ggplot2::margin(0,-10,0,0)))
+
+ggsave(
+  fs::path(
+    dir_figure,
+    "Volcano plots for diabetes remission.png"
+  ),
+  width = 4,
+  height = 3,
+  units = "in"
+)
+```
